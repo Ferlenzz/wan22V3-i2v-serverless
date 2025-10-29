@@ -16,7 +16,7 @@ jobs:
 
     env:
       IMAGE_NAME: wan22-i2v-serverless
-      DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }} #setting
 
     steps:
       - name: Checkout
