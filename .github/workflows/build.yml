@@ -4,8 +4,8 @@ on:
   push:
     branches: [ main, master ]
     tags:
-      - 'v*.*.*' 
-  workflow_dispatch: {}
+      - 'v*.*.*'         # если пушите релизные теги — тоже будут теги образа
+  workflow_dispatch: {}   # ручной запуск из Actions
 
 jobs:
   docker:
@@ -15,7 +15,7 @@ jobs:
       contents: read
 
     env:
-      IMAGE_NAME: wan22-i2v-serverless
+      IMAGE_NAME: wan22-i2v-serverless   # имя репозитория образа в Docker Hub
       DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
 
     steps:
@@ -57,3 +57,6 @@ jobs:
           sbom: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # передаем секрет HF_TOKEN в Dockerfile (RUN --mount=type=secret,id=HF_TOKEN ...)
+          secrets: |
+            HF_TOKEN=${{ secrets.HF_TOKEN }}
