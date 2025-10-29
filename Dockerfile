@@ -1,4 +1,4 @@
-# 1) БАЗА: их готовый образ под WAN 2.2 I2V/TI2V
+# их готовый образ под WAN 2.2 I2V/TI2V
 FROM wavespeed/model-deploy:wan22-i2v-latest
 
 RUN apt-get update && apt-get install -y ffmpeg python3-pip git-lfs && rm -rf /var/lib/apt/lists/*
