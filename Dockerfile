@@ -3,7 +3,7 @@ FROM pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    HF_HUB_OFFLINE=1              # оффлайн по умолчанию
+    HF_HUB_OFFLINE=1
 
 # Утилиты
 RUN apt-get update && apt-get install -y ffmpeg git git-lfs ca-certificates && \
@@ -32,7 +32,6 @@ RUN bash -lc '\
       sleep 15; \
     }; \
   done; \
-  # убрать историю и LFS-интермедиаты
   rm -rf /models/i2vgen-xl/.git /root/.cache/huggingface || true; \
   du -sh /models/i2vgen-xl || true \
 '
@@ -40,13 +39,11 @@ RUN bash -lc '\
 # Кэш артефактов (last image / last video)
 RUN mkdir -p /cache
 ENV CACHE_DIR=/cache \
-    MODEL_DIR=/models/i2vgen-xl
+    MODEL_DIR=/models/i2vgen-xl \
+    WARMUP=1 \
+    CPU_OFFLOAD=0
 
 WORKDIR /app
 COPY handler.py /app/handler.py
-
-# Прогрев при старте (держим модель горячей)
-ENV WARMUP=1 \
-    CPU_OFFLOAD=0
 
 CMD ["python", "/app/handler.py"]
