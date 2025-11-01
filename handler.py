@@ -19,12 +19,9 @@ def detect_data_dir() -> str:
             continue
         model_dir = os.path.join(base, "models", "i2vgen-xl")
         tried.append(model_dir)
-        if os.path.isdir(model_dir):
-            # признак валидной модели — наличие model_index.json
-            if os.path.isfile(os.path.join(model_dir, "model_index.json")):
-                print(f"[init] Using model at: {model_dir}")
-                return base
-    # если не нашли — кинем понятную ошибку с подсказкой
+        if os.path.isdir(model_dir) and os.path.isfile(os.path.join(model_dir, "model_index.json")):
+            print(f"[init] Using model at: {model_dir}")
+            return base
     raise RuntimeError(
         "Model files not found. Looked at:\n  - " + "\n  - ".join(tried) +
         "\nPlace 'ali-vilab/i2vgen-xl' into your Network Volume under "
@@ -79,12 +76,15 @@ def _save_last_image(img: Image.Image): img.save(LAST_IMAGE_PATH)
 
 def _load_last_image() -> Optional[Image.Image]:
     if os.path.exists(LAST_IMAGE_PATH):
-        try: return Image.open(LAST_IMAGE_PATH).convert("RGB")
-        except: return None
+        try:
+            return Image.open(LAST_IMAGE_PATH).convert("RGB")
+        except:
+            return None
     return None
 
 def _encode_file_b64(path: str) -> str:
-    with open(path, "rb") as f: return base64.b64encode(f.read()).decode()
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
 
 def _make_even(x: int) -> int:
     return x if x % 2 == 0 else x - 1  # для yuv420p нужны чётные размеры
@@ -120,7 +120,10 @@ def handler(job):
       num_frames: int (def 16)
       fps: int (def 8)
       width,height: int (def 512,512)
-      guidance_scale: float (def 7.0)
+      guidance_scale: float (def 7.2)
+      num_inference_steps: int (def 50)
+      temporal_smooth: float 0..0.6 (def 0.12)  # эксп. сглаживание между кадрами
+      quality: int (1..10, меньше=лучше, def 3)
       seed: int (опц.)
       use_last_image: bool (def false)
       store_last: bool (def true)
@@ -132,14 +135,16 @@ def handler(job):
     action = inp.get("action")
     if action == "get_last_image":
         img = _load_last_image()
-        if not img: return {"error": "no last image stored"}
+        if not img:
+            return {"error": "no last image stored"}
         bio = io.BytesIO(); img.save(bio, format="PNG")
         return {"image_b64": base64.b64encode(bio.getvalue()).decode()}
 
     if action == "clear_cache":
-        cleared=[]
+        cleared = []
         for p in (LAST_IMAGE_PATH, LAST_VIDEO_PATH):
-            if os.path.exists(p): os.remove(p); cleared.append(os.path.basename(p))
+            if os.path.exists(p):
+                os.remove(p); cleared.append(os.path.basename(p))
         return {"cleared": cleared}
 
     use_last = bool(inp.get("use_last_image", False))
@@ -150,10 +155,10 @@ def handler(job):
         if image is None and inp.get("image"):
             image = _pil_from_any(inp["image"])
         if image is None:
-            return {"error":"no last image stored; provide 'image' or set use_last_image=false"}
+            return {"error": "no last image stored; provide 'image' or set use_last_image=false"}
     else:
         if not inp.get("image"):
-            return {"error":"provide 'image' (URL / data:base64 / path) or set use_last_image=true"}
+            return {"error": "provide 'image' (URL / data:base64 / path) or set use_last_image=true"}
         image = _pil_from_any(inp["image"])
 
     prompt = inp.get("prompt", "")
@@ -161,7 +166,11 @@ def handler(job):
     fps = max(1, int(inp.get("fps", 8)))  # защита от fps < 1
     width = _make_even(int(inp.get("width", 512)))
     height = _make_even(int(inp.get("height", 512)))
-    guidance_scale = float(inp.get("guidance_scale", 7.0))
+    guidance_scale = float(inp.get("guidance_scale", 7.2))
+    num_inference_steps = int(inp.get("num_inference_steps", 50))
+    temporal_smooth = float(inp.get("temporal_smooth", 0.12))
+    temporal_smooth = max(0.0, min(temporal_smooth, 0.6))
+    quality = int(inp.get("quality", 3))  # imageio-ffmpeg: 1=лучше, 10=хуже
     seed = inp.get("seed")
     generator = torch.Generator(device=device).manual_seed(int(seed)) if seed else None
 
@@ -171,6 +180,7 @@ def handler(job):
         image=image,
         num_frames=num_frames,
         guidance_scale=guidance_scale,
+        num_inference_steps=num_inference_steps,
         height=height,
         width=width,
         generator=generator
@@ -183,27 +193,42 @@ def handler(job):
     else:
         frames_pil: List[Image.Image] = frames_any
 
-    # Приводим каждый кадр к RGB и uint8 — иначе ffmpeg/VideoWriter может ругаться
-    frames_np = [np.asarray(f.convert("RGB"), dtype=np.uint8) for f in frames_pil]
+    # Приведение к RGB/uint8 + экспоненциальное сглаживание во времени
+    frames_np: List[np.ndarray] = []
+    ema = None
+    alpha = temporal_smooth
+    for f in frames_pil:
+        arr = np.asarray(f.convert("RGB"), dtype=np.uint8).astype(np.float32)
+        if alpha > 0.0:
+            if ema is None:
+                ema = arr
+            else:
+                ema = alpha * arr + (1.0 - alpha) * ema
+            arr = np.clip(ema, 0, 255)
+        frames_np.append(arr.astype(np.uint8))
 
+    # --- Запись MP4 ---
     tmp_mp4 = os.path.join(tempfile.gettempdir(), "out.mp4")
-    # Используем yuv420п (широко совместим) и quality=8
     iio.imwrite(
         tmp_mp4,
         frames_np,
         fps=fps,
         codec="libx264",
-        pixelformat="yuv420p",
-        quality=8
+        pixelformat="yuv420p",   # максимально совместимый
+        quality=quality          # 1..10, меньше=лучше
     )
 
     if store_last:
-        try: _save_last_image(image)
-        except Exception as e: print("save last image failed:", e)
+        try:
+            _save_last_image(image)
+        except Exception as e:
+            print("save last image failed:", e)
 
     try:
-        if os.path.exists(LAST_VIDEO_PATH): os.remove(LAST_VIDEO_PATH)
-        os.replace(tmp_mp4, LAST_VIDEO_PATH); mp4_path = LAST_VIDEO_PATH
+        if os.path.exists(LAST_VIDEO_PATH):
+            os.remove(LAST_VIDEO_PATH)
+        os.replace(tmp_mp4, LAST_VIDEO_PATH)
+        mp4_path = LAST_VIDEO_PATH
     except Exception:
         mp4_path = tmp_mp4
 
