@@ -5,32 +5,49 @@ import imageio.v3 as iio
 import torch, runpod
 from diffusers import I2VGenXLPipeline, DPMSolverMultistepScheduler
 
+# ---------------------------
+# Авто-детект пути к Network Volume
+# ---------------------------
+def detect_data_dir() -> str:
+    # приоритет: явный ENV → стандартные точки монтирования
+    env_dir = os.getenv("DATA_DIR")
+    candidates = [env_dir, "/data", "/runpod-volume", "/workspace"]
+    tried = []
+    for base in candidates:
+        if not base:
+            continue
+        model_dir = os.path.join(base, "models", "i2vgen-xl")
+        tried.append(model_dir)
+        if os.path.isdir(model_dir):
+            # признак валидной модели — наличие model_index.json
+            if os.path.isfile(os.path.join(model_dir, "model_index.json")):
+                print(f"[init] Using model at: {model_dir}")
+                return base
+    # если не нашли — кинем понятную ошибку с подсказкой
+    raise RuntimeError(
+        "Model files not found. Looked at:\n  - " + "\n  - ".join(tried) +
+        "\nPlace 'ali-vilab/i2vgen-xl' into your Network Volume under "
+        "'<mount>/models/i2vgen-xl' and set DATA_DIR=<mount> if needed."
+    )
+
 # --- оффлайн режим ---
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ.pop("http_proxy", None)
 os.environ.pop("https_proxy", None)
 
-# Пути (NV примонтирован в /data)
-DATA_DIR  = os.environ.get("DATA_DIR", "/data")
-MODEL_DIR = os.environ.get("MODEL_DIR", os.path.join(DATA_DIR, "models", "i2vgen-xl"))
+DATA_DIR  = detect_data_dir()
+MODEL_DIR = os.path.join(DATA_DIR, "models", "i2vgen-xl")
 CACHE_DIR = os.environ.get("CACHE_DIR", "/cache")
 WARMUP    = os.environ.get("WARMUP", "0") == "1"
 CPU_OFFLOAD = os.environ.get("CPU_OFFLOAD", "0") == "1"
-
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 LAST_IMAGE_PATH = os.path.join(CACHE_DIR, "last_image.png")
 LAST_VIDEO_PATH = os.path.join(CACHE_DIR, "last_video.mp4")
 
-# Проверка наличия модели (скачиваний НЕ делаем)
-if not (os.path.isdir(MODEL_DIR) and any(os.scandir(MODEL_DIR))):
-    raise RuntimeError(
-        f"Model files not found at '{MODEL_DIR}'. "
-        "Put 'ali-vilab/i2vgen-xl' into your Network Volume first "
-        "(e.g. /data/models/i2vgen-xl), then restart the endpoint."
-    )
-
-# --- инициализация пайплайна (оффлайн) ---
+# ---------------------------
+# Инициализация пайплайна (оффлайн)
+# ---------------------------
 DTYPE = torch.float16
 device = "cuda"
 
@@ -44,7 +61,9 @@ else:
     pipe.to(device)
 pipe.enable_vae_tiling()
 
-# ---------- утилиты ----------
+# ---------------------------
+# Утилиты
+# ---------------------------
 def _pil_from_any(s: str) -> Image.Image:
     if s.startswith("data:"):
         b64 = s.split(",", 1)[1]
@@ -79,13 +98,16 @@ def _warmup_once():
             width=256,
             generator=torch.Generator(device=device).manual_seed(42)
         ).frames
+        print("[warmup] done")
     except Exception as e:
-        print("Warmup failed:", e)
+        print("[warmup] failed:", e)
 
 if WARMUP:
     _warmup_once()
 
-# ---------- handler ----------
+# ---------------------------
+# Handler
+# ---------------------------
 def handler(job):
     """
     input:
@@ -109,6 +131,7 @@ def handler(job):
         if not img: return {"error": "no last image stored"}
         bio = io.BytesIO(); img.save(bio, format="PNG")
         return {"image_b64": base64.b64encode(bio.getvalue()).decode()}
+
     if action == "clear_cache":
         cleared=[]
         for p in (LAST_IMAGE_PATH, LAST_VIDEO_PATH):
