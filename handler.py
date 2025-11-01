@@ -165,8 +165,8 @@ def handler(job):
     seed = inp.get("seed")
     generator = torch.Generator(device=device).manual_seed(int(seed)) if seed else None
 
-    # Генерация кадров
-    frames_pil: List[Image.Image] = pipe(
+    # --- Генерация кадров ---
+    out = pipe(
         prompt=prompt,
         image=image,
         num_frames=num_frames,
@@ -174,14 +174,28 @@ def handler(job):
         height=height,
         width=width,
         generator=generator
-    ).frames
+    )
+
+    frames_any = out.frames
+    # Иногда пайплайн возвращает [[PIL.Image,...]] при batch>1 — расплющим.
+    if isinstance(frames_any, list) and frames_any and isinstance(frames_any[0], list):
+        frames_pil: List[Image.Image] = frames_any[0]
+    else:
+        frames_pil: List[Image.Image] = frames_any
 
     # Приводим каждый кадр к RGB и uint8 — иначе ffmpeg/VideoWriter может ругаться
     frames_np = [np.asarray(f.convert("RGB"), dtype=np.uint8) for f in frames_pil]
 
     tmp_mp4 = os.path.join(tempfile.gettempdir(), "out.mp4")
-    # Используем yuv420p (широко совместим) и quality=8
-    iio.imwrite(tmp_mp4, frames_np, fps=fps, codec="libx264", pixelformat="yuv420p", quality=8)
+    # Используем yuv420п (широко совместим) и quality=8
+    iio.imwrite(
+        tmp_mp4,
+        frames_np,
+        fps=fps,
+        codec="libx264",
+        pixelformat="yuv420p",
+        quality=8
+    )
 
     if store_last:
         try: _save_last_image(image)
