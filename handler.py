@@ -2,6 +2,7 @@ import os, io, base64, tempfile, urllib.request
 from typing import Optional, List
 from PIL import Image
 import imageio.v3 as iio
+import numpy as np
 import torch, runpod
 from diffusers import I2VGenXLPipeline, DPMSolverMultistepScheduler
 
@@ -85,6 +86,9 @@ def _load_last_image() -> Optional[Image.Image]:
 def _encode_file_b64(path: str) -> str:
     with open(path, "rb") as f: return base64.b64encode(f.read()).decode()
 
+def _make_even(x: int) -> int:
+    return x if x % 2 == 0 else x - 1  # для yuv420p нужны чётные размеры
+
 def _warmup_once():
     try:
         px = Image.new("RGB", (256, 256), (255, 255, 255))
@@ -154,14 +158,15 @@ def handler(job):
 
     prompt = inp.get("prompt", "")
     num_frames = int(inp.get("num_frames", 16))
-    fps = int(inp.get("fps", 8))
-    width = int(inp.get("width", 512))
-    height = int(inp.get("height", 512))
+    fps = max(1, int(inp.get("fps", 8)))  # защита от fps < 1
+    width = _make_even(int(inp.get("width", 512)))
+    height = _make_even(int(inp.get("height", 512)))
     guidance_scale = float(inp.get("guidance_scale", 7.0))
     seed = inp.get("seed")
     generator = torch.Generator(device=device).manual_seed(int(seed)) if seed else None
 
-    frames: List[Image.Image] = pipe(
+    # Генерация кадров
+    frames_pil: List[Image.Image] = pipe(
         prompt=prompt,
         image=image,
         num_frames=num_frames,
@@ -171,8 +176,12 @@ def handler(job):
         generator=generator
     ).frames
 
+    # Приводим каждый кадр к RGB и uint8 — иначе ffmpeg/VideoWriter может ругаться
+    frames_np = [np.asarray(f.convert("RGB"), dtype=np.uint8) for f in frames_pil]
+
     tmp_mp4 = os.path.join(tempfile.gettempdir(), "out.mp4")
-    iio.imwrite(tmp_mp4, frames, fps=fps, codec="libx264", quality=8)
+    # Используем yuv420p (широко совместим) и quality=8
+    iio.imwrite(tmp_mp4, frames_np, fps=fps, codec="libx264", pixelformat="yuv420p", quality=8)
 
     if store_last:
         try: _save_last_image(image)
