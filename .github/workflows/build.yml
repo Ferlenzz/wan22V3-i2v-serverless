@@ -20,16 +20,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # === Сильно чистим диск перед сборкой (20–30 ГБ) ===
+      # ---- максимально освобождаем диск (30–50 ГБ) ----
       - name: Free up disk space
         run: |
-          echo "Disk BEFORE:"
-          df -h
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          echo "Disk BEFORE:" && df -h
+          sudo rm -rf /usr/share/dotnet \
+                       /usr/local/lib/android \
+                       /opt/ghc \
+                       /opt/hostedtoolcache/CodeQL \
+                       /opt/hostedtoolcache \
+                       /opt/az \
+                       "$AGENT_TOOLSDIRECTORY" || true
           docker system prune -af || true
           sudo apt-get clean
-          echo "Disk AFTER:"
-          df -h
+          sudo rm -rf /var/lib/apt/lists/*
+          echo "Disk AFTER:" && df -h
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -66,9 +71,7 @@ jobs:
           platforms: linux/amd64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # большие образы: отключаем лишние метаданные
           provenance: false
           sbom: false
-          # кэш билда (ускоряет повторные сборки; можно убрать если места мало)
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # отключаем кэш слоёв (меньше мусора на диске раннера)
+          no-cache: true
