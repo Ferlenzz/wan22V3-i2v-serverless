@@ -1,28 +1,59 @@
-import os, io, base64, tempfile, urllib.request
+import os, io, base64, tempfile, urllib.request, time
 from typing import Optional, List
 from PIL import Image
 import imageio.v3 as iio
 import torch, runpod
+
 from diffusers import I2VGenXLPipeline, DPMSolverMultistepScheduler
+from huggingface_hub import snapshot_download
 
-# --- оффлайн режим и пути ---
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ.pop("http_proxy", None)
-os.environ.pop("https_proxy", None)
-
-MODEL_DIR = os.environ.get("MODEL_DIR", "/models/i2vgen-xl")  # модель в образе
-CACHE_DIR = os.environ.get("CACHE_DIR", "/cache")
-WARMUP = os.environ.get("WARMUP", "0") == "1"
+# --- пути и флаги ---
+CACHE_DIR   = os.environ.get("CACHE_DIR", "/cache")
+DATA_DIR    = os.environ.get("DATA_DIR", "/data")               # <- монтируемый Network Volume
+MODEL_DIR   = os.environ.get("MODEL_DIR", "/data/models/i2vgen-xl")
+MODEL_ID    = os.environ.get("I2V_MODEL_ID", "ali-vilab/i2vgen-xl")
+WARMUP      = os.environ.get("WARMUP", "0") == "1"
 CPU_OFFLOAD = os.environ.get("CPU_OFFLOAD", "0") == "1"
+
 os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(os.path.dirname(MODEL_DIR), exist_ok=True)
 
 LAST_IMAGE_PATH = os.path.join(CACHE_DIR, "last_image.png")
 LAST_VIDEO_PATH = os.path.join(CACHE_DIR, "last_video.mp4")
 
+# --- докачка модели в NV если её ещё нет ---
+def ensure_model():
+    # если в каталоге есть файлы — считаем модель установленной
+    has_any = os.path.isdir(MODEL_DIR) and any(os.scandir(MODEL_DIR))
+    if has_any:
+        return
+    # включаем online на время загрузки
+    os.environ["HF_HUB_OFFLINE"] = "0"
+    for attempt in range(1, 4):
+        try:
+            snapshot_download(
+                repo_id=MODEL_ID,
+                local_dir=MODEL_DIR,
+                local_dir_use_symlinks=False,
+                resume_download=True,
+                max_workers=4,
+            )
+            break
+        except Exception as e:
+            print(f"[snapshot_download attempt {attempt}] {e}")
+            if attempt == 3:
+                raise
+            time.sleep(10)
+    # после докачки уходим в оффлайн
+    os.environ["HF_HUB_OFFLINE"] = "1"
+
+ensure_model()
+
+# --- инициализация пайплайна (из NV, офлайн) ---
+os.environ["HF_HUB_OFFLINE"] = "1"
 DTYPE = torch.float16
 device = "cuda"
 
-# --- инициализация пайплайна (в VRAM воркера) ---
 pipe = I2VGenXLPipeline.from_pretrained(
     MODEL_DIR, torch_dtype=DTYPE, variant="fp16", local_files_only=True
 )
@@ -62,7 +93,7 @@ def _encode_file_b64(path: str) -> str:
 def _warmup_once():
     try:
         px = Image.new("RGB", (256, 256), (255, 255, 255))
-        _save_last_image(px)  # сразу будет доступен use_last_image
+        _save_last_image(px)
         _ = pipe(
             prompt="warmup",
             image=px,
@@ -95,7 +126,6 @@ def handler(job):
     """
     inp = job.get("input", {}) or {}
 
-    # сервисные экшены
     action = inp.get("action")
     if action == "get_last_image":
         img = _load_last_image()
@@ -104,7 +134,6 @@ def handler(job):
         bio = io.BytesIO()
         img.save(bio, format="PNG")
         return {"image_b64": base64.b64encode(bio.getvalue()).decode()}
-
     if action == "clear_cache":
         cleared = []
         for p in (LAST_IMAGE_PATH, LAST_VIDEO_PATH):
@@ -116,7 +145,6 @@ def handler(job):
     use_last = bool(inp.get("use_last_image", False))
     store_last = True if inp.get("store_last", True) else False
 
-    # получить входную картинку
     image_field = inp.get("image")
     if use_last:
         image = _load_last_image()
@@ -129,7 +157,6 @@ def handler(job):
             return {"error": "provide 'image' (URL / data:base64 / path) or set use_last_image=true"}
         image = _pil_from_any(image_field)
 
-    # параметры генерации (быстро/дёшево по умолчанию)
     prompt = inp.get("prompt", "")
     num_frames = int(inp.get("num_frames", 16))
     fps = int(inp.get("fps", 8))
