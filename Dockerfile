@@ -5,8 +5,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1
 
 # Утилиты
-RUN apt-get update && apt-get install -y ffmpeg git git-lfs && \
-    rm -rf /var/lib/apt/lists/* && git lfs install
+RUN apt-get update && apt-get install -y ffmpeg git git-lfs ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    git lfs install
 
 # Обновить pip/тулзы
 RUN python -m pip install --upgrade pip setuptools wheel
@@ -17,17 +18,16 @@ RUN pip install --no-cache-dir \
     diffusers==0.30.0 transformers==4.43.3 accelerate==0.33.0 \
     safetensors==0.4.4 imageio[ffmpeg]==2.36.0 pillow==10.4.0 opencv-python==4.10.0.84
 
-# Кэш HF и предзагрузка модели
-ENV HF_HOME=/models/.cache/huggingface
-RUN mkdir -p $HF_HOME
-
+# --- Предзагрузка модели через git LFS (надёжнее на CI) ---
 ENV I2V_MODEL_ID=ali-vilab/i2vgen-xl
-RUN python - <<'PY'
-from huggingface_hub import snapshot_download
-import os
-mid=os.environ.get("I2V_MODEL_ID","ali-vilab/i2vgen-xl")
-snapshot_download(repo_id=mid, local_dir="/models/i2vgen-xl", local_dir_use_symlinks=False)
-PY
+RUN bash -lc '\
+  set -e; \
+  mkdir -p /models; \
+  git lfs install; \
+  git lfs clone https://huggingface.co/${I2V_MODEL_ID} /models/i2vgen-xl; \
+  # почистим .git, чтобы не таскать историю в образе
+  rm -rf /models/i2vgen-xl/.git; \
+'
 
 # Кэш артефактов (last image / last video)
 RUN mkdir -p /cache
