@@ -1,26 +1,30 @@
-import os, io, base64, tempfile, urllib.request, json
+import os, io, base64, tempfile, urllib.request
 from typing import Optional, List
-import imageio.v3 as iio
 from PIL import Image
-
-import torch
-import runpod
+import imageio.v3 as iio
+import torch, runpod
 from diffusers import I2VGenXLPipeline, DPMSolverMultistepScheduler
 
-MODEL_DIR = "/models/i2vgen-xl"
-MODEL_ID  = os.environ.get("I2V_MODEL_ID", MODEL_DIR)
-CPU_OFFLOAD = os.environ.get("CPU_OFFLOAD", "0") == "1"
+# --- оффлайн режим и пути ---
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ.pop("http_proxy", None)
+os.environ.pop("https_proxy", None)
+
+MODEL_DIR = os.environ.get("MODEL_DIR", "/models/i2vgen-xl")  # модель в образе
 CACHE_DIR = os.environ.get("CACHE_DIR", "/cache")
+WARMUP = os.environ.get("WARMUP", "0") == "1"
+CPU_OFFLOAD = os.environ.get("CPU_OFFLOAD", "0") == "1"
 os.makedirs(CACHE_DIR, exist_ok=True)
+
+LAST_IMAGE_PATH = os.path.join(CACHE_DIR, "last_image.png")
+LAST_VIDEO_PATH = os.path.join(CACHE_DIR, "last_video.mp4")
 
 DTYPE = torch.float16
 device = "cuda"
 
+# --- инициализация пайплайна (в VRAM воркера) ---
 pipe = I2VGenXLPipeline.from_pretrained(
-    MODEL_ID,
-    torch_dtype=DTYPE,
-    variant="fp16",
-    local_files_only=True  
+    MODEL_DIR, torch_dtype=DTYPE, variant="fp16", local_files_only=True
 )
 pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
 if CPU_OFFLOAD:
@@ -29,11 +33,8 @@ else:
     pipe.to(device)
 pipe.enable_vae_tiling()
 
-LAST_IMAGE_PATH = os.path.join(CACHE_DIR, "last_image.png")
-LAST_VIDEO_PATH = os.path.join(CACHE_DIR, "last_video.mp4")
-
+# ---------- утилиты ----------
 def _pil_from_any(image_field: str) -> Image.Image:
-    """Поддержка URL / data:base64 / локальный путь в контейнере."""
     if image_field.startswith("data:"):
         b64 = image_field.split(",", 1)[1]
         return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
@@ -59,14 +60,12 @@ def _encode_file_b64(path: str) -> str:
         return base64.b64encode(f.read()).decode()
 
 def _warmup_once():
-    """Одноразовый быстрый прогрев: tiny 8 кадров 256x256 из 1x1 PNG."""
     try:
-        px = Image.new("RGB", (1, 1), (255, 255, 255))
-        # сохраняем и как last_image, чтобы сразу был use_last_image
-        _save_last_image(px.resize((256, 256)))
+        px = Image.new("RGB", (256, 256), (255, 255, 255))
+        _save_last_image(px)  # сразу будет доступен use_last_image
         _ = pipe(
             prompt="warmup",
-            image=px.resize((256, 256)),
+            image=px,
             num_frames=8,
             guidance_scale=5.0,
             height=256,
@@ -76,28 +75,27 @@ def _warmup_once():
     except Exception as e:
         print("Warmup failed:", e)
 
-if os.environ.get("WARMUP", "0") == "1":
+if WARMUP:
     _warmup_once()
 
+# ---------- handler ----------
 def handler(job):
     """
-    Вход (JSON в job['input']):
-      - image: URL / data:base64 / путь (если use_last_image=true — можно опустить)
-      - prompt: str (опционально)
-      - num_frames: int (деф. 16)
-      - fps: int (деф. 8)
-      - width, height: int (деф. 512, 512)
-      - guidance_scale: float (деф. 7.0)
-      - seed: int (опц.)
-      - use_last_image: bool (деф. false) — использовать сохранённую последнюю картинку
-      - store_last: bool (деф. true) — сохранять текущую входную картинку как "последнюю"
-      - action: str (опц.) — "get_last_image" | "clear_cache"
-    Выход:
-      - video_b64
-      - (для get_last_image) image_b64
+    input:
+      image: URL / data:base64 / path (не требуется, если use_last_image=true)
+      prompt: str (опц.)
+      num_frames: int (def 16)
+      fps: int (def 8)
+      width,height: int (def 512,512)
+      guidance_scale: float (def 7.0)
+      seed: int (опц.)
+      use_last_image: bool (def false)
+      store_last: bool (def true)
+      action: "get_last_image" | "clear_cache" (опц.)
     """
     inp = job.get("input", {}) or {}
 
+    # сервисные экшены
     action = inp.get("action")
     if action == "get_last_image":
         img = _load_last_image()
@@ -106,17 +104,19 @@ def handler(job):
         bio = io.BytesIO()
         img.save(bio, format="PNG")
         return {"image_b64": base64.b64encode(bio.getvalue()).decode()}
+
     if action == "clear_cache":
-        status = {"cleared": []}
-        for p in [LAST_IMAGE_PATH, LAST_VIDEO_PATH]:
+        cleared = []
+        for p in (LAST_IMAGE_PATH, LAST_VIDEO_PATH):
             if os.path.exists(p):
                 os.remove(p)
-                status["cleared"].append(os.path.basename(p))
-        return status
+                cleared.append(os.path.basename(p))
+        return {"cleared": cleared}
 
     use_last = bool(inp.get("use_last_image", False))
     store_last = True if inp.get("store_last", True) else False
 
+    # получить входную картинку
     image_field = inp.get("image")
     if use_last:
         image = _load_last_image()
@@ -129,17 +129,16 @@ def handler(job):
             return {"error": "provide 'image' (URL / data:base64 / path) or set use_last_image=true"}
         image = _pil_from_any(image_field)
 
-    # Параметры
+    # параметры генерации (быстро/дёшево по умолчанию)
     prompt = inp.get("prompt", "")
-    num_frames = int(inp.get("num_frames", 16))  
-    fps = int(inp.get("fps", 8))                 
+    num_frames = int(inp.get("num_frames", 16))
+    fps = int(inp.get("fps", 8))
     width = int(inp.get("width", 512))
     height = int(inp.get("height", 512))
     guidance_scale = float(inp.get("guidance_scale", 7.0))
     seed = inp.get("seed")
     generator = torch.Generator(device=device).manual_seed(int(seed)) if seed else None
 
-    # Генерация
     frames: List[Image.Image] = pipe(
         prompt=prompt,
         image=image,
@@ -150,22 +149,22 @@ def handler(job):
         generator=generator
     ).frames
 
-    # Сохраним video и last image
     tmp_mp4 = os.path.join(tempfile.gettempdir(), "out.mp4")
     iio.imwrite(tmp_mp4, frames, fps=fps, codec="libx264", quality=8)
+
     if store_last:
-        # как "последнюю картинку" сохраняем исходную (не первый кадр)
         try:
             _save_last_image(image)
         except Exception as e:
             print("save last image failed:", e)
+
     try:
         if os.path.exists(LAST_VIDEO_PATH):
             os.remove(LAST_VIDEO_PATH)
         os.replace(tmp_mp4, LAST_VIDEO_PATH)
         mp4_path = LAST_VIDEO_PATH
     except Exception:
-        mp4_path = tmp_mp4  # fallback
+        mp4_path = tmp_mp4
 
     return {"video_b64": _encode_file_b64(mp4_path)}
 
