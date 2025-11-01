@@ -1,109 +1,172 @@
-import os, subprocess, base64, glob, tempfile, urllib.request, time
+import os, io, base64, tempfile, urllib.request, json
+from typing import Optional, List
+import imageio.v3 as iio
+from PIL import Image
+
+import torch
 import runpod
+from diffusers import I2VGenXLPipeline, DPMSolverMultistepScheduler
 
-WAN_REPO = os.environ.get("WAN_REPO", "/workspace/Wan2.2")
-CKPT_DIR = os.environ.get("WAN_CKPT_DIR", "/models/Wan2.2-TI2V-5B")
-WARMUP   = os.environ.get("WARMUP", "0") == "1"
-PIXEL_PNG_B64 = (
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMA"
-    "ASsJTYQAAAAASUVORK5CYII="
+MODEL_DIR = "/models/i2vgen-xl"
+MODEL_ID  = os.environ.get("I2V_MODEL_ID", MODEL_DIR)
+CPU_OFFLOAD = os.environ.get("CPU_OFFLOAD", "0") == "1"
+CACHE_DIR = os.environ.get("CACHE_DIR", "/cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+DTYPE = torch.float16
+device = "cuda"
+
+pipe = I2VGenXLPipeline.from_pretrained(
+    MODEL_ID,
+    torch_dtype=DTYPE,
+    variant="fp16",
+    local_files_only=True  
 )
+pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+if CPU_OFFLOAD:
+    pipe.enable_model_cpu_offload()
+else:
+    pipe.to(device)
+pipe.enable_vae_tiling()
 
-def _save_input_image(inp):
-    """
-    Поддержка:
-    - image: "https://..." (скачиваем)
-    - image: "data:image/...;base64,...."
-    - image: "/path/inside/container.png"
-    """
-    img = inp.get("image")
-    if not img:
-        return None
-    if isinstance(img, str) and img.startswith("data:"):
-        b64 = img.split(",", 1)[1]
-        p = os.path.join(tempfile.gettempdir(), "input.png")
-        with open(p, "wb") as f:
-            f.write(base64.b64decode(b64))
-        return p
-    if isinstance(img, str) and (img.startswith("http://") or img.startswith("https://")):
-        p = os.path.join(tempfile.gettempdir(), "input.png")
-        urllib.request.urlretrieve(img, p)
-        return p
-    return img  # считаем, что это путь внутри контейнера
+LAST_IMAGE_PATH = os.path.join(CACHE_DIR, "last_image.png")
+LAST_VIDEO_PATH = os.path.join(CACHE_DIR, "last_video.mp4")
 
-def _run_generate(task, size, prompt, image_path, extra_args=None):
-    """
-    Запуск их скрипта через CLI. TI2V-5B покрывает T2V/I2V, но для I2V нужна картинка.
-    size '1280*704' — «720p-friendly» для TI2V-5B.
-    """
-    cmd = [
-        "python", f"{WAN_REPO}/generate.py",
-        "--task", task,
-        "--size", size,
-        "--ckpt_dir", CKPT_DIR,
-        "--offload_model", "True",
-        "--convert_model_dtype",
-        "--t5_cpu"
-    ]
-    if prompt not in (None, ""):
-        cmd += ["--prompt", str(prompt)]
-    if image_path:
-        cmd += ["--image", image_path]
-    if isinstance(extra_args, list):
-        cmd += extra_args
+def _pil_from_any(image_field: str) -> Image.Image:
+    """Поддержка URL / data:base64 / локальный путь в контейнере."""
+    if image_field.startswith("data:"):
+        b64 = image_field.split(",", 1)[1]
+        return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+    if image_field.startswith("http://") or image_field.startswith("https://"):
+        tmp = os.path.join(tempfile.gettempdir(), "i2v.png")
+        urllib.request.urlretrieve(image_field, tmp)
+        return Image.open(tmp).convert("RGB")
+    return Image.open(image_field).convert("RGB")
 
-    subprocess.check_call(cmd)
+def _save_last_image(img: Image.Image) -> None:
+    img.save(LAST_IMAGE_PATH)
 
-    results_dir = os.path.join(WAN_REPO, "results")
-    latest = sorted(
-        [os.path.join(results_dir, d) for d in os.listdir(results_dir)],
-        key=os.path.getmtime
-    )[-1]
-    mp4s = sorted(glob.glob(os.path.join(latest, "*.mp4")))
-    return mp4s[-1] if mp4s else None
+def _load_last_image() -> Optional[Image.Image]:
+    if os.path.exists(LAST_IMAGE_PATH):
+        try:
+            return Image.open(LAST_IMAGE_PATH).convert("RGB")
+        except Exception:
+            return None
+    return None
+
+def _encode_file_b64(path: str) -> str:
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
 
 def _warmup_once():
-    """Одноразовый быстрый прогрев: tiny video на 0.5-1c из 1x1 PNG."""
+    """Одноразовый быстрый прогрев: tiny 8 кадров 256x256 из 1x1 PNG."""
     try:
-        tmp = os.path.join(tempfile.gettempdir(), "warmup.png")
-        with open(tmp, "wb") as f:
-            f.write(base64.b64decode(PIXEL_PNG_B64))
-        # короткая генерация: размер 256*144, меньше кадров
-        _run_generate(
-            task="ti2v-5B",
-            size="256*144",
+        px = Image.new("RGB", (1, 1), (255, 255, 255))
+        # сохраняем и как last_image, чтобы сразу был use_last_image
+        _save_last_image(px.resize((256, 256)))
+        _ = pipe(
             prompt="warmup",
-            image_path=tmp,
-            extra_args=["--num_frames", "8"]
-        )
+            image=px.resize((256, 256)),
+            num_frames=8,
+            guidance_scale=5.0,
+            height=256,
+            width=256,
+            generator=torch.Generator(device=device).manual_seed(42)
+        ).frames
     except Exception as e:
         print("Warmup failed:", e)
-if WARMUP:
+
+if os.environ.get("WARMUP", "0") == "1":
     _warmup_once()
 
 def handler(job):
-    inp = job.get("input", {})
-    task = inp.get("task", "ti2v-5B")        
-    size = inp.get("size", "1280*704")      
-    prompt = inp.get("prompt", "")     
-    image_path = _save_input_image(inp)
-    extra = []
+    """
+    Вход (JSON в job['input']):
+      - image: URL / data:base64 / путь (если use_last_image=true — можно опустить)
+      - prompt: str (опционально)
+      - num_frames: int (деф. 16)
+      - fps: int (деф. 8)
+      - width, height: int (деф. 512, 512)
+      - guidance_scale: float (деф. 7.0)
+      - seed: int (опц.)
+      - use_last_image: bool (деф. false) — использовать сохранённую последнюю картинку
+      - store_last: bool (деф. true) — сохранять текущую входную картинку как "последнюю"
+      - action: str (опц.) — "get_last_image" | "clear_cache"
+    Выход:
+      - video_b64
+      - (для get_last_image) image_b64
+    """
+    inp = job.get("input", {}) or {}
 
-    if "num_frames" in inp:
-        extra += ["--num_frames", str(int(inp["num_frames"]))]
-    if "fps" in inp:
-        extra += ["--fps", str(int(inp["fps"]))]
+    action = inp.get("action")
+    if action == "get_last_image":
+        img = _load_last_image()
+        if not img:
+            return {"error": "no last image stored"}
+        bio = io.BytesIO()
+        img.save(bio, format="PNG")
+        return {"image_b64": base64.b64encode(bio.getvalue()).decode()}
+    if action == "clear_cache":
+        status = {"cleared": []}
+        for p in [LAST_IMAGE_PATH, LAST_VIDEO_PATH]:
+            if os.path.exists(p):
+                os.remove(p)
+                status["cleared"].append(os.path.basename(p))
+        return status
 
-    if not image_path:
-        return {"error": "image is required for I2V. Provide 'image' as URL, path, or data:base64."}
+    use_last = bool(inp.get("use_last_image", False))
+    store_last = True if inp.get("store_last", True) else False
 
-    out_mp4 = _run_generate(task, size, prompt, image_path, extra_args=extra)
-    if not out_mp4:
-        return {"error": "no video produced"}
+    image_field = inp.get("image")
+    if use_last:
+        image = _load_last_image()
+        if image is None and image_field:
+            image = _pil_from_any(image_field)
+        if image is None:
+            return {"error": "no last image stored; provide 'image' or set use_last_image=false"}
+    else:
+        if not image_field:
+            return {"error": "provide 'image' (URL / data:base64 / path) or set use_last_image=true"}
+        image = _pil_from_any(image_field)
 
-    with open(out_mp4, "rb") as f:
-        v64 = base64.b64encode(f.read()).decode()
-    return {"video_b64": v64}
+    # Параметры
+    prompt = inp.get("prompt", "")
+    num_frames = int(inp.get("num_frames", 16))  
+    fps = int(inp.get("fps", 8))                 
+    width = int(inp.get("width", 512))
+    height = int(inp.get("height", 512))
+    guidance_scale = float(inp.get("guidance_scale", 7.0))
+    seed = inp.get("seed")
+    generator = torch.Generator(device=device).manual_seed(int(seed)) if seed else None
 
-# стартуем воркер
+    # Генерация
+    frames: List[Image.Image] = pipe(
+        prompt=prompt,
+        image=image,
+        num_frames=num_frames,
+        guidance_scale=guidance_scale,
+        height=height,
+        width=width,
+        generator=generator
+    ).frames
+
+    # Сохраним video и last image
+    tmp_mp4 = os.path.join(tempfile.gettempdir(), "out.mp4")
+    iio.imwrite(tmp_mp4, frames, fps=fps, codec="libx264", quality=8)
+    if store_last:
+        # как "последнюю картинку" сохраняем исходную (не первый кадр)
+        try:
+            _save_last_image(image)
+        except Exception as e:
+            print("save last image failed:", e)
+    try:
+        if os.path.exists(LAST_VIDEO_PATH):
+            os.remove(LAST_VIDEO_PATH)
+        os.replace(tmp_mp4, LAST_VIDEO_PATH)
+        mp4_path = LAST_VIDEO_PATH
+    except Exception:
+        mp4_path = tmp_mp4  # fallback
+
+    return {"video_b64": _encode_file_b64(mp4_path)}
+
 runpod.serverless.start({"handler": handler})
