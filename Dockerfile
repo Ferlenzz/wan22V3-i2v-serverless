@@ -34,9 +34,11 @@ RUN bash -lc '\
       sleep 15; \
     }; \
   done; \
-  # чистим историю и кэши, чтобы не раздувать образ
+  # почистим историю и кэши
   rm -rf /models/i2vgen-xl/.git /root/.cache/huggingface || true; \
-  du -sh /models/i2vgen-xl || true \
+  # контроль: размер и наличие файлов
+  du -sh /models/i2vgen-xl || true; \
+  test -f /models/i2vgen-xl/model_index.json || (echo "model_index.json missing" && exit 1) \
 '
 
 # Кэш артефактов (last image / last video)
