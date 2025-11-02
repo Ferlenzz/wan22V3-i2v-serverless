@@ -1,5 +1,11 @@
-.git
-.github
-**/__pycache__/
-**/*.ipynb_checkpoints
-vendor/*.zip
+# обычный мусор
+**/.git
+**/.github
+**/__pycache__
+**/*.pyc
+*.log
+
+# ⚠️ гарантированно включаем нужные нам файлы в контекст
+!vendor/
+!vendor/VideoCrafter-main.zip
+!vc1/configs/inference_i2v_512_vc1_offline.yaml
