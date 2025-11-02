@@ -9,21 +9,49 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     steps:
-      # 1) Чекаут твоего репо (где Dockerfile и handler)
       - name: Checkout this repo
         uses: actions/checkout@v4
 
-      # 2) Чекаут ВНЕШНЕГО репозитория OpenGVLab/VideoCrafter2 в папку vc2/
-      - name: Checkout VideoCrafter2 (external repo)
-        uses: actions/checkout@v4
-        with:
-          repository: OpenGVLab/VideoCrafter2   # <— внешний репозиторий
-          ref: main                             # можно зафиксировать SHA
-          path: vc2                             # сложим исходники VC2 в ./vc2
-          token: ${{ secrets.GITHUB_TOKEN }}    # встроенный; обычно можно не указывать
+      # === Надёжное получение исходников VC2 как tar.gz (без git clone) ===
+      - name: Fetch VideoCrafter2 sources (tarball + mirrors)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf vc2 /tmp/vc2 /tmp/vc2.tar.gz
+          mkdir -p /tmp/vc2
 
-      - name: Show vc2 tree (debug)
-        run: ls -la vc2 | head
+          urls=(
+            "https://codeload.github.com/OpenGVLab/VideoCrafter2/tar.gz/refs/heads/main"
+            "https://api.github.com/repos/OpenGVLab/VideoCrafter2/tarball"
+            "https://ghproxy.com/https://codeload.github.com/OpenGVLab/VideoCrafter2/tar.gz/refs/heads/main"
+            "https://hub.fastgit.org/OpenGVLab/VideoCrafter2/archive/refs/heads/main.tar.gz"
+          )
+
+          ok=0
+          for u in "${urls[@]}"; do
+            echo "Try: $u"
+            if curl -L --fail -o /tmp/vc2.tar.gz "$u"; then
+              tar -xzf /tmp/vc2.tar.gz -C /tmp/vc2
+              vc2dir=$(find /tmp/vc2 -maxdepth 1 -type d -name "*VideoCrafter2*" | head -n1 || true)
+              if [[ -n "${vc2dir}" ]]; then
+                mkdir -p vc2
+                # копируем содержимое папки архива в ./vc2
+                shopt -s dotglob
+                cp -r "${vc2dir}/"* vc2/
+                ok=1
+                break
+              fi
+            fi
+          done
+
+          if [[ $ok -ne 1 ]]; then
+            echo "FATAL: cannot download VideoCrafter2 sources from all mirrors"
+            exit 1
+          fi
+
+          test -f vc2/README.md || { echo "FATAL: vc2/README.md not found"; exit 1; }
+          echo "VC2 tree:"
+          ls -la vc2 | head
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -34,7 +62,6 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # 3) Сборка: Dockerfile ожидает папку ./vc2 и копирует её в /vc2
       - name: Build & Push
         uses: docker/build-push-action@v6
         with:
