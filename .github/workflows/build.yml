@@ -1,74 +1,51 @@
-name: Docker Build & Push
+- name: Fetch VideoCrafter2 sources (mirrored tarballs)
+  shell: bash
+  run: |
+    set -euo pipefail
+    rm -rf vc2 /tmp/vc2 /tmp/vc2.zip
+    mkdir -p /tmp/vc2
 
-on:
-  push:
-    branches: [ main, master ]
-  workflow_dispatch: {}
+    urls=(
+      # GitHub зеркала (без codeload)
+      "https://gitcode.com/mirrors/OpenGVLab/VideoCrafter2/archive/main.zip"
+      "https://gitcode.net/mirrors/OpenGVLab/VideoCrafter2/archive/main.zip"
+      "https://gitee.com/mirrors/OpenGVLab/VideoCrafter2/repository/archive/main.zip"
+      "https://hub.fastgit.org/OpenGVLab/VideoCrafter2/archive/refs/heads/main.zip"
+      "https://download.nju.edu.cn/github/OpenGVLab/VideoCrafter2/archive/refs/heads/main.zip"
 
-jobs:
-  docker:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout this repo
-        uses: actions/checkout@v4
+      # Через ghproxy (полезно, если обычный github недоступен)
+      "https://ghproxy.com/https://github.com/OpenGVLab/VideoCrafter2/archive/refs/heads/main.zip"
 
-      # === Надёжное получение исходников VC2 как tar.gz (без git clone) ===
-      - name: Fetch VideoCrafter2 sources (tarball + mirrors)
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf vc2 /tmp/vc2 /tmp/vc2.tar.gz
-          mkdir -p /tmp/vc2
+      # как fallback: codeload через ghproxy (иногда срабатывает)
+      "https://ghproxy.com/https://codeload.github.com/OpenGVLab/VideoCrafter2/zip/refs/heads/main"
 
-          urls=(
-            "https://codeload.github.com/OpenGVLab/VideoCrafter2/tar.gz/refs/heads/main"
-            "https://api.github.com/repos/OpenGVLab/VideoCrafter2/tarball"
-            "https://ghproxy.com/https://codeload.github.com/OpenGVLab/VideoCrafter2/tar.gz/refs/heads/main"
-            "https://hub.fastgit.org/OpenGVLab/VideoCrafter2/archive/refs/heads/main.tar.gz"
-          )
+      # прямой GitHub как последний шанс
+      "https://github.com/OpenGVLab/VideoCrafter2/archive/refs/heads/main.zip"
+    )
 
-          ok=0
-          for u in "${urls[@]}"; do
-            echo "Try: $u"
-            if curl -L --fail -o /tmp/vc2.tar.gz "$u"; then
-              tar -xzf /tmp/vc2.tar.gz -C /tmp/vc2
-              vc2dir=$(find /tmp/vc2 -maxdepth 1 -type d -name "*VideoCrafter2*" | head -n1 || true)
-              if [[ -n "${vc2dir}" ]]; then
-                mkdir -p vc2
-                # копируем содержимое папки архива в ./vc2
-                shopt -s dotglob
-                cp -r "${vc2dir}/"* vc2/
-                ok=1
-                break
-              fi
-            fi
-          done
+    ok=0
+    for u in "${urls[@]}"; do
+      echo "Try: $u"
+      rm -f /tmp/vc2.zip
+      if curl -L --fail --connect-timeout 20 --retry 3 -o /tmp/vc2.zip "$u"; then
+        unzip -q /tmp/vc2.zip -d /tmp/vc2 || true
+        # имя папки внутри архива может быть разным; найдём первую, похожую на *VideoCrafter2*
+        vc2dir=$(find /tmp/vc2 -maxdepth 1 -type d -iname "*videocrafter2*" | head -n1 || true)
+        if [[ -n "${vc2dir}" ]]; then
+          mkdir -p vc2
+          shopt -s dotglob
+          cp -r "${vc2dir}/"* vc2/
+          ok=1
+          break
+        fi
+      fi
+    done
 
-          if [[ $ok -ne 1 ]]; then
-            echo "FATAL: cannot download VideoCrafter2 sources from all mirrors"
-            exit 1
-          fi
+    if [[ $ok -ne 1 ]]; then
+      echo "FATAL: cannot download VideoCrafter2 sources from mirrors"
+      exit 1
+    fi
 
-          test -f vc2/README.md || { echo "FATAL: vc2/README.md not found"; exit 1; }
-          echo "VC2 tree:"
-          ls -la vc2 | head
-
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Build & Push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          platforms: linux/amd64
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/vc2-i2v:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+    test -f vc2/README.md || { echo "FATAL: vc2/README.md not found"; exit 1; }
+    echo "VC2 tree:"
+    ls -la vc2 | head
