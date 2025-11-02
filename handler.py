@@ -1,386 +1,312 @@
-# handler.py
-import os
-import io
-import base64
-import tempfile
-import subprocess
-import urllib.request
-import shutil
-import hashlib
-import errno
+import os, io, sys, json, base64, tempfile, subprocess, shutil, glob
 from typing import Optional, List
 from PIL import Image
 import imageio.v3 as iio
 import runpod
 
-
-# ==============================
-#  NV / DATA_DIR авто-детект
-# ==============================
-def detect_data_dir() -> str:
-    env_dir = os.getenv("DATA_DIR")
-    candidates = [env_dir, "/runpod-volume", "/data", "/workspace"]
-    tried = []
-    for base in candidates:
-        if not base:
-            continue
-        model_dir = os.path.join(base, "models", "videocrafter2-i2v")
-        tried.append(model_dir)
-        if os.path.isdir(model_dir):
-            print(f"[init] Using DATA_DIR={base}")
-            return base
-    raise RuntimeError(
-        "Model dir not found. Checked:\n  - " + "\n  - ".join(tried) +
-        "\nPut weights into '<NV>/models/videocrafter2-i2v/model.ckpt' and set DATA_DIR=<NV>."
-    )
-
-
-def file_exists(p: Optional[str]) -> bool:
-    return bool(p) and os.path.isfile(p)
-
-
-def find_first(root: str, predicates: list) -> Optional[str]:
-    for dirpath, _, files in os.walk(root):
-        for fn in files:
-            name = fn.lower()
-            for pred in predicates:
-                if pred(name):
-                    return os.path.join(dirpath, fn)
-    return None
-
-
-def autodetect_vc2_script_and_cfg(vc2_root: str) -> tuple[str, str]:
-    # Script: .sh > image2video.py > i2v*.py
-    script = find_first(vc2_root, [
-        lambda n: n == "run_image2video.sh",
-        lambda n: "image2video" in n and n.endswith(".py"),
-        lambda n: "i2v" in n and n.endswith(".py"),
-    ])
-    # Config: prefer 512, else any i2v
-    cfg = find_first(vc2_root, [
-        lambda n: n.startswith("inference_i2v") and "512" in n and n.endswith(".yaml"),
-        lambda n: n.startswith("inference_i2v") and n.endswith(".yaml"),
-    ])
-    if not script or not cfg:
-        raise RuntimeError(
-            "Unable to auto-detect VC2 script/cfg.\n"
-            f"script={script}\n cfg={cfg}\n"
-            "Check that your /vc2 tree contains run_image2video.sh or *image2video*.py, "
-            "and configs/inference_i2v*.yaml"
-        )
-    return script, cfg
-
-
-# ==============================
-#  Оффлайн-режим и базовые ENV
-# ==============================
+# ---------------------------
+# Полезные ENV/пути
+# ---------------------------
+DATA_DIR = os.environ.get("DATA_DIR") or "/runpod-volume"
+HF_HOME  = os.environ.get("HF_HOME")  or os.path.join(DATA_DIR, "hf_cache")
 os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ.pop("http_proxy", None)
-os.environ.pop("https_proxy", None)
-
-DATA_DIR = detect_data_dir()
-MODEL_CKPT = os.path.join(DATA_DIR, "models", "videocrafter2-i2v", "model.ckpt")
-if not os.path.isfile(MODEL_CKPT):
-    raise RuntimeError(f"Checkpoint not found: {MODEL_CKPT}")
-
-# HF cache в NV
-HF_HOME = os.environ.get("HF_HOME", os.path.join(DATA_DIR, "hf_cache"))
 os.environ["HF_HOME"] = HF_HOME
 os.environ["HUGGINGFACE_HUB_CACHE"] = HF_HOME
 
-# open-clip будет класть/читать сюда же
-if not os.environ.get("OPENCLIP_CACHE_DIR"):
-    os.environ["OPENCLIP_CACHE_DIR"] = HF_HOME
-
-# Путь к VC2: либо из ENV, либо авто-поиск
-VC2_SCRIPT_ENV = os.environ.get("VC2_SCRIPT", "")
-VC2_CFG_ENV    = os.environ.get("VC2_CFG", "")
-if file_exists(VC2_SCRIPT_ENV) and file_exists(VC2_CFG_ENV):
-    VC2_SCRIPT, VC2_CFG = VC2_SCRIPT_ENV, VC2_CFG_ENV
-else:
-    VC2_SCRIPT, VC2_CFG = autodetect_vc2_script_and_cfg("/vc2")
-
-CACHE_DIR  = os.environ.get("CACHE_DIR", "/cache")
+CACHE_DIR = os.environ.get("CACHE_DIR", "/cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+VC1_SCRIPT = os.environ.get("VC1_SCRIPT", "/vc1/scripts/run_image2video.sh")
+VC1_CFG    = os.environ.get("VC1_CFG", "/vc1/configs/inference_i2v_512_vc1_offline.yaml")
 
-# ==============================
-#  Офлайн кэш для open-clip + HF
-# ==============================
-def _sha256_of(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
+# где лежит офлайн CLIP из transformers
+CLIP_DIR_DEFAULT = os.path.join(DATA_DIR, "models", "transformers", "openai-clip-vit-large-patch14")
+
+LAST_IMAGE_PATH = os.path.join(CACHE_DIR, "last_image.png")
+LAST_VIDEO_PATH = os.path.join(CACHE_DIR, "last_video.mp4")
 
 
-def _write_snapshot(cache_root: str, model_id: str, filename: str, src_file: str) -> None:
+# ---------------------------
+# Вспомогательные функции
+# ---------------------------
+def _log(*a): print("[i2v]", *a, flush=True)
+
+def _ensure_vc1_paths() -> (str, str, str):
+    """Проверяем, что есть vc1, скрипт и конфиг. Возвращаем (repo_root, script, cfg)."""
+    repo_root = os.path.dirname(os.path.dirname(VC1_SCRIPT)) if VC1_SCRIPT else "/vc1"
+    script = VC1_SCRIPT
+    cfg = VC1_CFG
+
+    if not os.path.isfile(script):
+        # пытаемся найти
+        maybe = glob.glob("/vc1/**/run_image2video.sh", recursive=True) + glob.glob("/vc1/*.sh")
+        script = next((p for p in maybe if "run_image2video" in os.path.basename(p)), None)
+        if not script:
+            raise RuntimeError("Не найден run_image2video.sh (ожидали /vc1/scripts/run_image2video.sh)")
+
+    if not os.path.isfile(cfg):
+        # подхватим любой inference_i2v_512*.yaml
+        cand = glob.glob("/vc1/**/inference_i2v_512*.yaml", recursive=True)
+        cfg = next(iter(cand), None)
+        if not cfg:
+            raise RuntimeError("Не найден конфиг inference_i2v_512*.yaml")
+
+    return repo_root, script, cfg
+
+def _ensure_checkpoint_link(repo_root: str):
     """
-    Создаёт офлайн-снапшот HuggingFace для model_id внутри cache_root.
-    Поддерживает две структуры:
-      1) <cache_root>/hub/models--{org}--{repo}/...
-      2) <cache_root>/models--{org}--{repo}/...   (когда cache_dir передают в hf_hub_download)
+    Создаём 'жёсткий' путь чекпойнта внутри дерева VC1:
+    /vc1/checkpoints/i2v_512_v1/model.ckpt -> /DATA_DIR/models/videocrafter2-i2v/model.ckpt
     """
-    for style in ("hub", ""):
-        base = os.path.join(cache_root, style) if style else cache_root
-        model_dir = os.path.join(base, "models--" + model_id.replace("/", "--"))
-        blobs_dir = os.path.join(model_dir, "blobs")
-        refs_dir  = os.path.join(model_dir, "refs")
-        snaps_dir = os.path.join(model_dir, "snapshots")
-        snap_id   = "f" * 40  # валидный 40-hex id
-        snap_dir  = os.path.join(snaps_dir, snap_id)
-
-        os.makedirs(blobs_dir, exist_ok=True)
-        os.makedirs(refs_dir,  exist_ok=True)
-        os.makedirs(snap_dir,  exist_ok=True)
-
-        digest = _sha256_of(src_file)
-        blob_path = os.path.join(blobs_dir, digest)
-        if not os.path.exists(blob_path):
-            shutil.copy2(src_file, blob_path)
-
-        dst = os.path.join(snap_dir, filename)
-        if os.path.islink(dst) or os.path.exists(dst):
-            try:
-                os.remove(dst)
-            except:
-                pass
-
-        rel = os.path.relpath(blob_path, start=snap_dir)
-        try:
-            os.symlink(rel, dst)
-        except Exception:
-            shutil.copy2(blob_path, dst)
-
-        with open(os.path.join(refs_dir, "main"), "w") as f:
-            f.write(snap_id)
-
-        print(f"[hf-cache] prepared ({'hub' if style else 'cache_dir'}) {model_id} -> {dst}")
-
-
-def ensure_openclip_cached() -> None:
-    """
-    Кладём один и тот же CLIP-вес сразу в:
-      - HF_HOME / HUGGINGFACE_HUB_CACHE
-      - OPENCLIP_CACHE_DIR (или ~/.cache/clip)
-    Чтобы hf_hub_download(...) находил файл в офлайне.
-    """
-    src = os.path.join(DATA_DIR, "models", "clip", "open_clip_pytorch_model.bin")
+    src = os.path.join(DATA_DIR, "models", "videocrafter2-i2v", "model.ckpt")
     if not os.path.isfile(src):
-        raise RuntimeError(
-            f"Missing CLIP weight: {src}\n"
-            "Place 'open_clip_pytorch_model.bin' into <DATA_DIR>/models/clip/ ."
-        )
+        raise RuntimeError(f"Чекпойнт не найден: {src}")
 
-    targets = set()
+    ckpt_dir = os.path.join(repo_root, "checkpoints", "i2v_512_v1")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    dst = os.path.join(ckpt_dir, "model.ckpt")
+    try:
+        if os.path.islink(dst) or os.path.exists(dst):
+            os.remove(dst)
+    except:
+        pass
+    os.symlink(src, dst)
+    return dst
 
-    # 1) HF_HOME / HUGGINGFACE_HUB_CACHE
-    for var in ("HF_HOME", "HUGGINGFACE_HUB_CACHE"):
-        val = os.environ.get(var)
-        if val:
-            targets.add(os.path.abspath(val))
+def _prepare_offline_clip_transformers():
+    """
+    Готовим офлайн snapshot для transformers CLIP (openai/clip-vit-large-patch14).
+    Берём из DATA_DIR/models/transformers/openai-clip-vit-large-patch14/
+    и размещаем в HF_HOME так, чтобы from_pretrained(local_files_only=True) всё находил.
+    """
+    src = os.environ.get("TRANSFORMERS_CLIP_DIR", "") or CLIP_DIR_DEFAULT
+    if not os.path.isdir(src):
+        _log(f"Внимание: папка CLIP transformers не найдена: {src}")
+        return  # handler всё равно попробует работать; VC1 может не трогать from_pretrained в python — но лучше положить папку.
 
-    # 2) OPENCLIP_CACHE_DIR или дефолт ~/.cache/clip
-    occ = os.environ.get("OPENCLIP_CACHE_DIR") or os.path.join(os.path.expanduser("~"), ".cache", "clip")
-    targets.add(os.path.abspath(occ))
+    # целевой каталог
+    tgt_repo = os.path.join(HF_HOME, "hub", "models--openai--clip-vit-large-patch14")
+    tgt_snap = os.path.join(tgt_repo, "snapshots", "offline")
+    os.makedirs(tgt_snap, exist_ok=True)
 
-    # Набор частых идентификаторов, которые запрашивает open-clip
-    ids = [
-        "laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
-        "laion/CLIP-ViT-g-14-laion2B-s12B-b42K",
-        "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k",
-        "laion/CLIP-ViT-L-14-laion2B-s32B-b82K",
-    ]
-    for tgt in targets:
-        os.makedirs(tgt, exist_ok=True)
-        for mid in ids:
-            _write_snapshot(tgt, mid, "open_clip_pytorch_model.bin", src)
+    # минимальный набор файлов (если есть — копируем всё)
+    for name in os.listdir(src):
+        sp = os.path.join(src, name)
+        dp = os.path.join(tgt_snap, name)
+        if os.path.isdir(sp): 
+            if not os.path.exists(dp): shutil.copytree(sp, dp, dirs_exist_ok=True)
+        else:
+            shutil.copy2(sp, dp)
+
+    # refs/main -> offline
+    refs_dir = os.path.join(tgt_repo, "refs")
+    os.makedirs(refs_dir, exist_ok=True)
+    with open(os.path.join(refs_dir, "main"), "w") as f:
+        f.write("offline")
+
+    _log("Офлайн CLIP transformers оформлен:", tgt_repo)
 
 
-# ==============================
-#  Утилиты
-# ==============================
 def _pil_from_any(s: str) -> Image.Image:
     if s.startswith("data:"):
         b64 = s.split(",", 1)[1]
         return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
     if s.startswith("http://") or s.startswith("https://"):
-        p = os.path.join(tempfile.gettempdir(), "i2v_input.png")
+        p = os.path.join(tempfile.gettempdir(), "i2v_in.png")
+        import urllib.request
         urllib.request.urlretrieve(s, p)
         return Image.open(p).convert("RGB")
     return Image.open(s).convert("RGB")
 
+def _save_last_image(img: Image.Image):
+    img.save(LAST_IMAGE_PATH)
 
-def _encode_file_b64(path: str) -> str:
+def _load_last_image() -> Optional[Image.Image]:
+    if os.path.exists(LAST_IMAGE_PATH):
+        try:
+            return Image.open(LAST_IMAGE_PATH).convert("RGB")
+        except:
+            return None
+    return None
+
+def _encode_b64(path: str) -> str:
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode()
 
+def _ensure_mp4_from_frames(save_dir: str, fps: int) -> Optional[str]:
+    # ищем mp4; если нет — собираем из кадров
+    mp4s = sorted(glob.glob(os.path.join(save_dir, "*.mp4")))
+    if mp4s: 
+        return mp4s[0]
 
-def _safe_link_or_copy(src: str, dst: str):
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
-    if os.path.islink(dst) or os.path.exists(dst):
-        try:
-            os.remove(dst)
-        except OSError as e:
-            if e.errno != errno.ENOENT:
-                raise
-    try:
-        rel = os.path.relpath(src, start=os.path.dirname(dst))
-        os.symlink(rel, dst)
-    except Exception:
-        shutil.copy2(src, dst)
-
-
-# ==============================
-#  Запуск VC2 (i2v) с фоллбэками
-# ==============================
-def _build_args(alias: dict, input_png: str, prompt: str, out_dir: str,
-                num_frames: int, fps: int, steps: int, guidance: float, seed: Optional[int]) -> list[str]:
-    return [
-        "--config", VC2_CFG,
-        alias.get("ckpt", "--ckpt"), MODEL_CKPT,  # вариативный флаг чекпойнта
-        alias.get("image", "--image"),  input_png,
-        alias.get("prompt", "--prompt"), prompt,
-        alias.get("save_dir", "--save_dir"), out_dir,
-        alias.get("fps", "--fps"), str(fps),
-        alias.get("frames", "--frames"), str(num_frames),
-        alias.get("steps", "--num_inference_steps"), str(steps),
-        alias.get("guidance", "--guidance_scale"), str(guidance),
-    ] + (([alias.get("seed", "--seed"), str(seed)] if seed is not None else []))
+    frames = sorted(glob.glob(os.path.join(save_dir, "*.png")))
+    if not frames:
+        return None
+    out_mp4 = os.path.join(save_dir, "out.mp4")
+    imgs = [Image.open(p).convert("RGB") for p in frames]
+    iio.imwrite(out_mp4, imgs, fps=fps, codec="libx264", quality=8)
+    return out_mp4
 
 
-def run_vc2_i2v(img_path: str, prompt: str, out_dir: str,
-                num_frames: int, fps: int, steps: int, guidance: float, seed: Optional[int]) -> None:
-    os.makedirs(out_dir, exist_ok=True)
+# ---------------------------
+# Основной запуск VC1 (shell)
+# ---------------------------
+def run_vc1(image: Image.Image, prompt: str, num_frames: int, fps: int,
+            height: int, width: int, guidance_scale: float, steps: int,
+            seed: Optional[int]) -> str:
+    repo_root, script, cfg = _ensure_vc1_paths()
+    _log("VC1 root:", repo_root)
+    _log("script:", script)
+    _log("cfg:", cfg)
 
-    input_png = os.path.join(out_dir, "input.png")
-    Image.open(img_path).convert("RGB").save(input_png)
+    # чекпойнт
+    ckpt = _ensure_checkpoint_link(repo_root)
 
-    # Интерпретатор
-    if VC2_SCRIPT.endswith(".sh"):
-        launcher = ["bash", VC2_SCRIPT]
-    else:
-        launcher = ["python", VC2_SCRIPT]
+    # офлайн CLIP transformers
+    _prepare_offline_clip_transformers()
 
-    # Корень репозитория: если скрипт в /vc2/scripts — поднимемся на уровень
-    script_dir = os.path.dirname(VC2_SCRIPT)
-    repo_root = script_dir if os.path.basename(script_dir) != "scripts" else os.path.dirname(script_dir)
+    # входное изображение
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    in_png = os.path.join(CACHE_DIR, "vc1_input.png")
+    image.save(in_png)
 
-    # --- shim: заставляем open-clip иметь атрибут input_patchnorm у VisionTransformer ---
-    try:
-        sitecustomize_path = os.path.join(repo_root, "sitecustomize.py")
-        with open(sitecustomize_path, "w", encoding="utf-8") as f:
-            f.write(
-                "import sys\n"
-                "try:\n"
-                "    from open_clip.model import VisionTransformer\n"
-                "    if not hasattr(VisionTransformer, 'input_patchnorm'):\n"
-                "        setattr(VisionTransformer, 'input_patchnorm', False)\n"
-                "except Exception:\n"
-                "    pass\n"
-            )
-        print(f"[vc2] sitecustomize shim written: {sitecustomize_path}")
-    except Exception as e:
-        print(f"[vc2] warn: cannot write sitecustomize shim: {e}")
+    # выходной каталог
+    out_dir = tempfile.mkdtemp(prefix="vc1_out_", dir=CACHE_DIR)
 
-    # --- поддержка жёсткого пути, который требуют некоторые ревизии VC ---
-    hard_ckpt = os.path.join(repo_root, "checkpoints", "i2v_512_v1", "model.ckpt")
-    try:
-        _safe_link_or_copy(MODEL_CKPT, hard_ckpt)
-        print(f"[vc2] provided hard ckpt path: {hard_ckpt}")
-    except Exception as e:
-        print(f"[vc2] warn: can't prepare hard ckpt path: {e}")
-
-    # Возможные варианты флагов у разных ревизий VC2
-    aliases = [
-        {},  # default: --ckpt, --frames, --save_dir, ...
-        {"frames": "--num_frames"},
-        {"save_dir": "--output_dir"},
-        {"save_dir": "--output"},
-        {"image": "--input"},
-        {"frames": "--nframes"},
-        {"ckpt": "--ckpt_path"},  # некоторые скрипты требуют --ckpt_path
+    # строим команду (скрипт VC1 понимает --config, --ckpt, --image, --prompt, --save_dir, --n_frames, --num_inference_steps и пр.)
+    # важное: некоторые ревизии ждут --frames вместо --n_frames — оставим оба
+    cmd = [
+        "bash", script,
+        "--config", cfg,
+        "--ckpt", ckpt,
+        "--image", in_png,
+        "--prompt", prompt,
+        "--save_dir", out_dir,
+        "--n_frames", str(num_frames),
+        "--frames",   str(num_frames),    # на всякий
+        "--num_inference_steps", str(steps),
+        "--height", str(height),
+        "--width",  str(width),
+        "--fps",    str(fps),
+        "--guidance_scale", str(guidance_scale),
     ]
+    if seed is not None:
+        cmd += ["--seed", str(int(seed))]
 
-    last_out = ""
-    for alias in aliases:
-        args = _build_args(alias, input_png, prompt, out_dir, num_frames, fps, steps, guidance, seed)
-        cmd = launcher + args
-        print("[vc2] script:", VC2_SCRIPT)
-        print("[vc2] cfg   :", VC2_CFG)
-        print("[vc2] cwd   :", repo_root)
-        print("[vc2] cmd   :", " ".join(cmd))
-        proc = subprocess.run(
-            cmd,
-            cwd=repo_root,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
+    _log("run:", " ".join(cmd))
+    env = {**os.environ}  # офлайн HF уже прописан
+    proc = subprocess.run(cmd, cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    _log("vc1 stdout:\n" + proc.stdout)
+
+    if proc.returncode != 0:
+        raise RuntimeError("VideoCrafter inference failed")
+
+    # результат
+    mp4 = _ensure_mp4_from_frames(out_dir, fps=fps)
+    if mp4 is None:
+        raise RuntimeError("Не найдено видео/кадры после инференса")
+
+    # перенос в стабильный путь
+    if os.path.exists(LAST_VIDEO_PATH):
+        try: os.remove(LAST_VIDEO_PATH)
+        except: pass
+    shutil.copy2(mp4, LAST_VIDEO_PATH)
+    return LAST_VIDEO_PATH
+
+
+# ---------------------------
+# Warmup (опционально)
+# ---------------------------
+def _warmup():
+    try:
+        img = Image.new("RGB", (256, 256), (240, 240, 240))
+        _save_last_image(img)
+        _ = run_vc1(
+            image=img, prompt="warmup",
+            num_frames=4, fps=6, height=256, width=256,
+            guidance_scale=5.0, steps=8, seed=42
         )
-        last_out = proc.stdout
-        if proc.returncode == 0:
-            return
-        if "unrecognized arguments" in last_out or "unrecognised arguments" in last_out:
-            print("[vc2] retry with different flags...")
-            continue
-        break
-
-    print(last_out)
-    raise RuntimeError("VideoCrafter2 inference failed")
+        _log("warmup done")
+    except Exception as e:
+        _log("warmup failed:", e)
 
 
-# ==============================
-#  Runpod handler
-# ==============================
+# ---------------------------
+# RunPod handler
+# ---------------------------
 def handler(job):
-    # Подготовим офлайн-кэш open-clip (HF + cache_dir)
-    ensure_openclip_cached()
+    """
+    input:
+      image: data:base64 / url / path (если use_last_image=false)
+      prompt: str
+      num_frames: int (def 24)
+      fps: int (def 8)
+      width,height: int (def 512,512)
+      guidance_scale: float (def 7.0)
+      num_inference_steps: int (def 42)
+      seed: int (опц.)
+      use_last_image: bool (def false)
+      store_last: bool (def true)
+      action: "get_last_image" | "clear_cache"
+    """
+    args = job.get("input", {}) or {}
 
-    inp = job.get("input", {}) or {}
-    image = inp.get("image")
-    if not image:
-        return {"error": "provide 'image' (URL / data:base64 / path)"}
-    prompt = inp.get("prompt", "")
+    # сервисные экшены
+    action = args.get("action")
+    if action == "get_last_image":
+        img = _load_last_image()
+        if not img: return {"error": "no last image stored"}
+        bio = io.BytesIO(); img.save(bio, format="PNG")
+        return {"image_b64": base64.b64encode(bio.getvalue()).decode()}
 
-    num_frames = int(inp.get("num_frames", 40))   # ~5 сек @ fps=8
-    fps        = int(inp.get("fps", 8))
-    width      = int(inp.get("width", 512))
-    height     = int(inp.get("height", 512))
-    steps      = int(inp.get("num_inference_steps", 42))
-    guidance   = float(inp.get("guidance_scale", 7.0))
-    seed_raw   = inp.get("seed")
-    seed       = int(seed_raw) if (seed_raw is not None and str(seed_raw).strip() != "") else None
+    if action == "clear_cache":
+        cleared=[]
+        for p in (LAST_IMAGE_PATH, LAST_VIDEO_PATH):
+            if os.path.exists(p):
+                try: os.remove(p); cleared.append(os.path.basename(p))
+                except: pass
+        return {"cleared": cleared}
 
-    work = tempfile.mkdtemp(prefix="vc2i2v_")
-    in_png = os.path.join(work, "input.png")
-    _pil_from_any(image).resize((width, height), Image.LANCZOS).save(in_png)
+    use_last = bool(args.get("use_last_image", False))
+    store_last = True if args.get("store_last", True) else False
 
-    out_dir = os.path.join(work, "out")
-    run_vc2_i2v(in_png, prompt, out_dir, num_frames, fps, steps, guidance, seed)
+    if use_last:
+        image = _load_last_image()
+        if image is None and args.get("image"):
+            image = _pil_from_any(args["image"])
+        if image is None:
+            return {"error":"no last image stored; provide 'image' or set use_last_image=false"}
+    else:
+        if not args.get("image"):
+            return {"error":"provide 'image' (URL / data:base64 / path) or set use_last_image=true"}
+        image = _pil_from_any(args["image"])
 
-    # Пытаемся найти готовый mp4
-    mp4 = None
-    for name in ("result.mp4", "output.mp4", "video.mp4"):
-        p = os.path.join(out_dir, name)
-        if os.path.exists(p):
-            mp4 = p
-            break
+    prompt = args.get("prompt", "")
+    num_frames = int(args.get("num_frames", 24))
+    fps = int(args.get("fps", 8))
+    width = int(args.get("width", 512))
+    height = int(args.get("height", 512))
+    guidance_scale = float(args.get("guidance_scale", 7.0))
+    steps = int(args.get("num_inference_steps", 42))
+    seed = args.get("seed")
+    if seed is not None:
+        try: seed = int(seed)
+        except: seed = None
 
-    # Если нет — соберём из кадров сами
-    if not mp4:
-        frames = []
-        for fn in sorted(os.listdir(out_dir)):
-            if fn.lower().endswith((".png", ".jpg", ".jpeg")):
-                frames.append(iio.imread(os.path.join(out_dir, fn)))
-        if not frames:
-            return {"error": "No mp4 or frames produced by VC2"}
-        mp4 = os.path.join(out_dir, "result.mp4")
-        iio.imwrite(mp4, frames, fps=fps, codec="libx264", pixelformat="yuv420p", quality=8)
+    # запуск
+    out_mp4 = run_vc1(
+        image=image, prompt=prompt, num_frames=num_frames, fps=fps,
+        height=height, width=width, guidance_scale=guidance_scale,
+        steps=steps, seed=seed
+    )
 
-    with open(mp4, "rb") as f:
-        video_b64 = base64.b64encode(f.read()).decode()
-    return {"video_b64": video_b64}
+    if store_last:
+        try: _save_last_image(image)
+        except: pass
 
+    return {"video_b64": _encode_b64(out_mp4)}
+
+# Если хочешь включить прогрев при старте воркера — раскомментируй:
+# _warmup()
 
 runpod.serverless.start({"handler": handler})
