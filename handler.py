@@ -126,10 +126,22 @@ def run_vc2_i2v(img_path: str, prompt: str, out_dir: str,
     else:
         cmd = ["python", VC2_SCRIPT] + args_common
 
+    # <<< ВАЖНО: запускаем из корня репозитория VC2, чтобы относительные пути работали
+    script_dir = os.path.dirname(VC2_SCRIPT)
+    repo_root = script_dir if os.path.basename(script_dir) != "scripts" else os.path.dirname(script_dir)
+
     print("[vc2] script:", VC2_SCRIPT)
     print("[vc2] cfg   :", VC2_CFG)
+    print("[vc2] cwd   :", repo_root)
     print("[vc2] cmd   :", " ".join(cmd))
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    proc = subprocess.run(
+        cmd,
+        cwd=repo_root,                      # ключевая строка
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
     if proc.returncode != 0:
         print(proc.stdout)
         raise RuntimeError("VideoCrafter2 inference failed")
