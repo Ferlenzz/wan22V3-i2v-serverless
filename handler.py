@@ -24,6 +24,40 @@ def detect_data_dir() -> str:
         "\nPut weights into '<NV>/models/videocrafter2-i2v/model.ckpt' and set DATA_DIR to <NV>."
     )
 
+def file_exists(p: Optional[str]) -> bool:
+    return bool(p) and os.path.isfile(p)
+
+def find_first(root: str, patterns: list[str]) -> Optional[str]:
+    for dirpath, _, files in os.walk(root):
+        for fn in files:
+            name = fn.lower()
+            for pat in patterns:
+                if pat(name):
+                    return os.path.join(dirpath, fn)
+    return None
+
+def autodetect_vc2_script_and_cfg(vc2_root: str) -> tuple[str, str]:
+    # 1) Скрипт: пробуем .sh, потом .py
+    script = find_first(vc2_root, [
+        lambda n: n == "run_image2video.sh",
+        lambda n: "image2video" in n and n.endswith(".py"),
+        lambda n: "i2v" in n and n.endswith(".py"),
+    ])
+    # 2) Конфиг: сперва 512, потом любой i2v
+    cfg = find_first(vc2_root, [
+        lambda n: n.startswith("inference_i2v") and "512" in n and n.endswith(".yaml"),
+        lambda n: n.startswith("inference_i2v") and n.endswith(".yaml"),
+    ])
+    if not script or not cfg:
+        raise RuntimeError(
+            "Unable to auto-detect VC2 script/cfg.\n"
+            f"script={script}\n cfg={cfg}\n"
+            "Check that your /vc2 tree contains run_image2video.sh or *image2video*.py, "
+            "and configs/inference_i2v*.yaml"
+        )
+    return script, cfg
+
+# --- оффлайн режим ---
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ.pop("http_proxy", None)
 os.environ.pop("https_proxy", None)
@@ -33,8 +67,13 @@ MODEL_CKPT = os.path.join(DATA_DIR, "models", "videocrafter2-i2v", "model.ckpt")
 if not os.path.isfile(MODEL_CKPT):
     raise RuntimeError(f"Checkpoint not found: {MODEL_CKPT}")
 
-VC2_SCRIPT = os.environ.get("VC2_SCRIPT", "/vc2/run_image2video.sh")  # .sh или .py
-VC2_CFG    = os.environ.get("VC2_CFG", "/vc2/configs/inference_i2v_512_v1.0.yaml")
+# Берём из ENV, но если файла нет — автопоиск
+VC2_SCRIPT_ENV = os.environ.get("VC2_SCRIPT", "")
+VC2_CFG_ENV    = os.environ.get("VC2_CFG", "")
+if file_exists(VC2_SCRIPT_ENV) and file_exists(VC2_CFG_ENV):
+    VC2_SCRIPT, VC2_CFG = VC2_SCRIPT_ENV, VC2_CFG_ENV
+else:
+    VC2_SCRIPT, VC2_CFG = autodetect_vc2_script_and_cfg("/vc2")
 
 CACHE_DIR  = os.environ.get("CACHE_DIR", "/cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -63,12 +102,10 @@ def run_vc2_i2v(img_path: str, prompt: str, out_dir: str,
                num_frames: int, fps: int, steps: int, guidance: float, seed: Optional[int]) -> None:
     os.makedirs(out_dir, exist_ok=True)
 
-    # Подготовим временный PNG, чтобы быть независимыми от формата
     input_png = os.path.join(out_dir, "input.png")
     Image.open(img_path).convert("RGB").save(input_png)
 
-    # Собираем аргументы: в AILab-CVC/VideoCrafter есть run_image2video.sh,
-    # который принимает --config/--ckpt/--image/--prompt/--save_dir/--fps/--frames/--num_inference_steps/--guidance_scale
+    # Общие аргументы (названия флагов такие у run_image2video.sh и большинства image2video.py в VC)
     args_common = [
         "--config", VC2_CFG,
         "--ckpt",   MODEL_CKPT,
@@ -83,14 +120,15 @@ def run_vc2_i2v(img_path: str, prompt: str, out_dir: str,
     if seed is not None:
         args_common += ["--seed", str(seed)]
 
-    # Выбор интерпретатора по расширению
+    # Выбор интерпретатора
     if VC2_SCRIPT.endswith(".sh"):
         cmd = ["bash", VC2_SCRIPT] + args_common
     else:
-        # считаем, что это .py
         cmd = ["python", VC2_SCRIPT] + args_common
 
-    print("[vc2] cmd:", " ".join(cmd))
+    print("[vc2] script:", VC2_SCRIPT)
+    print("[vc2] cfg   :", VC2_CFG)
+    print("[vc2] cmd   :", " ".join(cmd))
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if proc.returncode != 0:
         print(proc.stdout)
@@ -104,7 +142,7 @@ def handler(job):
         return {"error": "provide 'image' (URL / data:base64 / path)"}
     prompt = inp.get("prompt", "")
 
-    num_frames = int(inp.get("num_frames", 40))   # ~5с при fps=8
+    num_frames = int(inp.get("num_frames", 40))
     fps        = int(inp.get("fps", 8))
     width      = int(inp.get("width", 512))
     height     = int(inp.get("height", 512))
@@ -113,7 +151,6 @@ def handler(job):
     seed       = inp.get("seed")
     seed       = int(seed) if seed is not None else None
 
-    # Сохраняем вход и выход
     work = tempfile.mkdtemp(prefix="vc2i2v_")
     in_png = os.path.join(work, "input.png")
     _pil_from_any(image).resize((width, height)).save(in_png)
@@ -121,14 +158,14 @@ def handler(job):
     out_dir = os.path.join(work, "out")
     run_vc2_i2v(in_png, prompt, out_dir, num_frames, fps, steps, guidance, seed)
 
-    # найдём видео (mp4)
+    # попробуем найти готовый mp4
     mp4 = None
     for name in ("result.mp4", "output.mp4", "video.mp4"):
         p = os.path.join(out_dir, name)
         if os.path.exists(p):
             mp4 = p; break
     if not mp4:
-        # если VC2 сохранил как images → соберём сами
+        # соберём видео из кадров, если их нагенерили
         frames = []
         for fn in sorted(os.listdir(out_dir)):
             if fn.lower().endswith((".png", ".jpg", ".jpeg")):
