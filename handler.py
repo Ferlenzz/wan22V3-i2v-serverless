@@ -1,3 +1,4 @@
+# handler.py
 import os
 import io
 import base64
@@ -6,6 +7,7 @@ import subprocess
 import urllib.request
 import shutil
 import hashlib
+import errno
 from typing import Optional, List
 from PIL import Image
 import imageio.v3 as iio
@@ -215,6 +217,21 @@ def _encode_file_b64(path: str) -> str:
         return base64.b64encode(f.read()).decode()
 
 
+def _safe_link_or_copy(src: str, dst: str):
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if os.path.islink(dst) or os.path.exists(dst):
+        try:
+            os.remove(dst)
+        except OSError as e:
+            if e.errno != errno.ENOENT:
+                raise
+    try:
+        rel = os.path.relpath(src, start=os.path.dirname(dst))
+        os.symlink(rel, dst)
+    except Exception:
+        shutil.copy2(src, dst)
+
+
 # ==============================
 #  Запуск VC2 (i2v) с фоллбэками
 # ==============================
@@ -222,7 +239,7 @@ def _build_args(alias: dict, input_png: str, prompt: str, out_dir: str,
                 num_frames: int, fps: int, steps: int, guidance: float, seed: Optional[int]) -> list[str]:
     return [
         "--config", VC2_CFG,
-        "--ckpt",   MODEL_CKPT,
+        alias.get("ckpt", "--ckpt"), MODEL_CKPT,  # <-- флаг чекпойнта вариативный
         alias.get("image", "--image"),  input_png,
         alias.get("prompt", "--prompt"), prompt,
         alias.get("save_dir", "--save_dir"), out_dir,
@@ -240,16 +257,6 @@ def run_vc2_i2v(img_path: str, prompt: str, out_dir: str,
     input_png = os.path.join(out_dir, "input.png")
     Image.open(img_path).convert("RGB").save(input_png)
 
-    # Возможные варианты флагов у разных ревизий VC2
-    aliases = [
-        {},  # default
-        {"frames": "--num_frames"},
-        {"save_dir": "--output_dir"},
-        {"save_dir": "--output"},
-        {"image": "--input"},
-        {"frames": "--nframes"},
-    ]
-
     # Интерпретатор
     if VC2_SCRIPT.endswith(".sh"):
         launcher = ["bash", VC2_SCRIPT]
@@ -259,6 +266,25 @@ def run_vc2_i2v(img_path: str, prompt: str, out_dir: str,
     # Корень репозитория: если скрипт в /vc2/scripts — поднимемся на уровень
     script_dir = os.path.dirname(VC2_SCRIPT)
     repo_root = script_dir if os.path.basename(script_dir) != "scripts" else os.path.dirname(script_dir)
+
+    # --- поддержка жёсткого пути, который требуют некоторые ревизии VC ---
+    hard_ckpt = os.path.join(repo_root, "checkpoints", "i2v_512_v1", "model.ckpt")
+    try:
+        _safe_link_or_copy(MODEL_CKPT, hard_ckpt)
+        print(f"[vc2] provided hard ckpt path: {hard_ckpt}")
+    except Exception as e:
+        print(f"[vc2] warn: can't prepare hard ckpt path: {e}")
+
+    # Возможные варианты флагов у разных ревизий VC2
+    aliases = [
+        {},  # default: --ckpt, --frames, --save_dir, ...
+        {"frames": "--num_frames"},
+        {"save_dir": "--output_dir"},
+        {"save_dir": "--output"},
+        {"image": "--input"},
+        {"frames": "--nframes"},
+        {"ckpt": "--ckpt_path"},  # некоторые скрипты требуют --ckpt_path
+    ]
 
     last_out = ""
     for alias in aliases:
