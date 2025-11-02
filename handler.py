@@ -288,4 +288,4 @@ def handler(job):
         video_b64 = base64.b64encode(f.read()).decode()
     return {"video_b64": video_b64}
 
-runpod.serverless.start({"handler": handler}}
+runpod.serverless.start({"handler": handler})
