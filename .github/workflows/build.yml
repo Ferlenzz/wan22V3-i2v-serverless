@@ -1,77 +1,26 @@
-name: Docker Build & Push (Docker Hub)
+name: Docker Build & Push
 
 on:
   push:
     branches: [ main, master ]
-    tags: [ 'v*.*.*' ]
   workflow_dispatch: {}
 
 jobs:
   docker:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
-    env:
-      IMAGE_NAME: i2vgen-xl-serverless
-      DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # ---- максимально освобождаем диск (30–50 ГБ) ----
-      - name: Free up disk space
-        run: |
-          echo "Disk BEFORE:" && df -h
-          sudo rm -rf /usr/share/dotnet \
-                       /usr/local/lib/android \
-                       /opt/ghc \
-                       /opt/hostedtoolcache/CodeQL \
-                       /opt/hostedtoolcache \
-                       /opt/az \
-                       "$AGENT_TOOLSDIRECTORY" || true
-          docker system prune -af || true
-          sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/*
-          echo "Disk AFTER:" && df -h
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          driver-opts: |
-            image=moby/buildkit:latest
-            network=host
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Extract metadata (tags, labels)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: docker.io/${{ env.DOCKERHUB_USER }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix=sha-,format=short
-            type=ref,event=tag
-
-      - name: Build & Push
-        uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           push: true
           platforms: linux/amd64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          provenance: false
-          sbom: false
-          # отключаем кэш слоёв (меньше мусора на диске раннера)
-          no-cache: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/vc2-i2v:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
