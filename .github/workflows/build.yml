@@ -2,8 +2,8 @@ name: Docker Build & Push (VC1 I2V)
 
 on:
   push:
-    branches: [ main, master ]
-    tags: [ 'v*.*.*' ]
+    branches: [ "main", "master" ]
+    tags: [ "v*.*.*" ]
   workflow_dispatch: {}
 
 jobs:
@@ -17,38 +17,30 @@ jobs:
       IMAGE_NAME: vc1-i2v
 
     steps:
-      # 1) Забираем репозиторий + LFS (если архив в LFS)
       - name: Checkout (with LFS)
         uses: actions/checkout@v4
         with:
           lfs: true
           fetch-depth: 0
 
-      # 2) Проверяем, что ZIP попал в build-контекст
-      - name: Sanity: show tree & ensure vendor zip exists
-        shell: bash
+      - name: Ensure vendor zip exists
         run: |
-          echo "::group::Repo tree"
           ls -lah
-          echo "::endgroup::"
-          echo "::group::vendor/"
           ls -lah vendor || true
-          echo "::endgroup::"
-          test -f vendor/VideoCrafter-main.zip || {
-            echo "FATAL: vendor/VideoCrafter-main.zip missing in build context"; exit 1; }
+          if [ ! -f vendor/VideoCrafter-main.zip ]; then
+            echo "FATAL: vendor/VideoCrafter-main.zip missing in build context"
+            exit 1
+          fi
 
-      # 3) Buildx
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 4) Логин в Docker Hub
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # 5) Теги/лейблы: latest (на дефолтной ветке), sha-<short>, и для git-тегов vX.Y.Z
       - name: Extract metadata (tags/labels)
         id: meta
         uses: docker/metadata-action@v5
@@ -59,7 +51,6 @@ jobs:
             type=sha,prefix=sha-,format=short
             type=ref,event=tag
 
-      # 6) Сборка и пуш
       - name: Build & Push
         uses: docker/build-push-action@v6
         with:
