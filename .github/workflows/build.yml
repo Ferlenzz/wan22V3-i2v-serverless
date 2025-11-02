@@ -1,39 +1,24 @@
-name: Docker Build & Push (VC2 I2V)
+name: Docker Build & Push (VC1 I2V)
 
 on:
   push:
     branches: [ main, master ]
-    tags: [ 'v*.*.*' ]         
+    tags: [ 'v*.*.*' ]
   workflow_dispatch: {}
 
 jobs:
   docker:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+
     env:
-      IMAGE_NAME: vc2-i2v
+      IMAGE_NAME: vc1-i2v
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
-
-      # Разархивируем локально положенный архив в ./vc2 (без сетевых скачиваний)
-      - name: Unpack VideoCrafter sources (no network)
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf vc2 /tmp/vc2
-          test -f vendor/VideoCrafter-main.zip || { echo "vendor/VideoCrafter-main.zip not found"; exit 1; }
-          unzip -q vendor/VideoCrafter-main.zip -d /tmp
-          VC2DIR=$(find /tmp -maxdepth 1 -type d -iname "VideoCrafter-main" | head -n1 || true)
-          if [ -z "$VC2DIR" ]; then
-            echo "FATAL: cannot find VideoCrafter-main dir inside zip"
-            exit 1
-          fi
-          mkdir -p vc2
-          shopt -s dotglob
-          cp -r "$VC2DIR"/* vc2/
-          rm -rf vc2/.git vc2/.github vc2/docs vc2/examples vc2/tests || true
-          ls -la vc2 | head
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -44,30 +29,23 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # Сформируем теги и метаданные образа
-      - name: Extract metadata (tags, labels)
+      - name: Extract metadata (tags/labels)
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}
           tags: |
-            # latest только на дефолтной ветке
             type=raw,value=latest,enable={{is_default_branch}}
-            # короткий SHA коммита, например sha-1a2b3c4
-            type=sha,format=short,prefix=sha-
-            # если пушим git-тег v1.2.3 — добавим v1.2.3, v1.2, v1
+            type=sha,prefix=sha-,format=short
             type=ref,event=tag
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
 
       - name: Build & Push
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64
           push: true
+          platforms: linux/amd64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
