@@ -239,7 +239,7 @@ def _build_args(alias: dict, input_png: str, prompt: str, out_dir: str,
                 num_frames: int, fps: int, steps: int, guidance: float, seed: Optional[int]) -> list[str]:
     return [
         "--config", VC2_CFG,
-        alias.get("ckpt", "--ckpt"), MODEL_CKPT,  # <-- флаг чекпойнта вариативный
+        alias.get("ckpt", "--ckpt"), MODEL_CKPT,  # вариативный флаг чекпойнта
         alias.get("image", "--image"),  input_png,
         alias.get("prompt", "--prompt"), prompt,
         alias.get("save_dir", "--save_dir"), out_dir,
@@ -266,6 +266,23 @@ def run_vc2_i2v(img_path: str, prompt: str, out_dir: str,
     # Корень репозитория: если скрипт в /vc2/scripts — поднимемся на уровень
     script_dir = os.path.dirname(VC2_SCRIPT)
     repo_root = script_dir if os.path.basename(script_dir) != "scripts" else os.path.dirname(script_dir)
+
+    # --- shim: заставляем open-clip иметь атрибут input_patchnorm у VisionTransformer ---
+    try:
+        sitecustomize_path = os.path.join(repo_root, "sitecustomize.py")
+        with open(sitecustomize_path, "w", encoding="utf-8") as f:
+            f.write(
+                "import sys\n"
+                "try:\n"
+                "    from open_clip.model import VisionTransformer\n"
+                "    if not hasattr(VisionTransformer, 'input_patchnorm'):\n"
+                "        setattr(VisionTransformer, 'input_patchnorm', False)\n"
+                "except Exception:\n"
+                "    pass\n"
+            )
+        print(f"[vc2] sitecustomize shim written: {sitecustomize_path}")
+    except Exception as e:
+        print(f"[vc2] warn: cannot write sitecustomize shim: {e}")
 
     # --- поддержка жёсткого пути, который требуют некоторые ревизии VC ---
     hard_ckpt = os.path.join(repo_root, "checkpoints", "i2v_512_v1", "model.ckpt")
